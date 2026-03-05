@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "Apache-2.0"}
 authors = [
-    {name = "wangmengdi", email = "790990241@qq.com"}
+    {name = "xucailiang", email = "xucailiang.ai@gmail.com"}
 ]
 keywords = ["audio", "livekit", "realtime", "video", "webrtc"]
 classifiers = [
@@ -28,7 +28,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "livekit-agents==1.2.9",
+    "livekit-agents~=1.4.4",
     "numpy",
     "openai>=1.75.0",
     "osc-data==0.2.2",

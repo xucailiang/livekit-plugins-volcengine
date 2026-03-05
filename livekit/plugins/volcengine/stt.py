@@ -256,7 +256,9 @@ class STT(stt.STT):
     ) -> None:
         super().__init__(
             capabilities=stt.STTCapabilities(
-                streaming=True, interim_results=interim_results
+                streaming=True,
+                interim_results=interim_results,
+                offline_recognize=False,
             )
         )
 
@@ -289,6 +291,22 @@ class STT(stt.STT):
 
         return self._session
 
+    @property
+    def model(self) -> str:
+        """返回当前使用的模型标识符"""
+        return self._opts.cluster
+
+    @property
+    def provider(self) -> str:
+        """返回提供商名称"""
+        return "volcengine"
+
+    async def aclose(self) -> None:
+        """关闭所有流"""
+        for stream in list(self._streams):
+            await stream.aclose()
+        self._streams.clear()
+
     async def _recognize_impl(
         self,
         buffer: AudioBuffer,
@@ -296,7 +314,10 @@ class STT(stt.STT):
         language: NotGivenOr[str] = NOT_GIVEN,
         conn_options: APIConnectOptions,
     ) -> stt.SpeechEvent:
-        raise NotImplementedError("not implemented")
+        raise NotImplementedError(
+            "Volcengine STT does not support offline recognition. "
+            "Use stream() for streaming recognition instead."
+        )
 
     def stream(
         self,
@@ -352,6 +373,15 @@ class SpeechStream(stt.SpeechStream):
 
     async def _run(self) -> None:
         closing_ws = False
+        logger.debug(
+            "stt stream started",
+            extra={
+                "request_id": self._request_id,
+                "model": self._stt.model,
+                "provider": self._stt.provider,
+                "sample_rate": self._opts.sample_rate,
+            },
+        )
 
         @utils.log_exceptions(logger=logger)
         async def send_task(ws: aiohttp.ClientWebSocketResponse):
@@ -406,6 +436,9 @@ class SpeechStream(stt.SpeechStream):
                         self._audio_duration_collector.flush()
                         await ws.send_str(SpeechStream._FINALIZE_MSG)
                         has_ended = False
+
+            # input channel 关闭后，标记为正常关闭
+            closing_ws = True
 
         @utils.log_exceptions(logger=logger)
         async def recv_task(ws: aiohttp.ClientWebSocketResponse):
@@ -500,7 +533,13 @@ class SpeechStream(stt.SpeechStream):
             self._speaking = True
             start_event = stt.SpeechEvent(type=stt.SpeechEventType.START_OF_SPEECH)
             self._event_ch.send_nowait(start_event)
-            logger.info("transcription start")
+            logger.info(
+                "transcription start",
+                extra={
+                    "request_id": self._request_id,
+                    "model": self._stt.model,
+                },
+            )
             if text:
                 alternatives = [
                     stt.SpeechData(
@@ -556,7 +595,14 @@ class SpeechStream(stt.SpeechStream):
             )
             self._event_ch.send_nowait(end_event)
             self._speaking = False
-            logger.info("transcription end", extra={"text": text})
+            logger.info(
+                "transcription end",
+                extra={
+                    "request_id": self._request_id,
+                    "text": text,
+                    "model": self._stt.model,
+                },
+            )
 
 
 def parse_response(res):

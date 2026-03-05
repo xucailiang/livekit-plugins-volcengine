@@ -12,7 +12,7 @@ from openai.types.chat.chat_completion_chunk import Choice
 from livekit.agents import APIConnectionError, APIStatusError, APITimeoutError, llm
 from livekit.agents.llm import ToolChoice
 from livekit.agents.llm.chat_context import ChatContext
-from livekit.agents.llm.tool_context import FunctionTool
+from livekit.agents.llm.tool_context import Tool
 from livekit.agents.types import (
     DEFAULT_API_CONNECT_OPTIONS,
     NOT_GIVEN,
@@ -94,7 +94,7 @@ class LLM(llm.LLM):
         self,
         *,
         chat_ctx: ChatContext,
-        tools: list[FunctionTool] | None = None,
+        tools: list[Tool] | None = None,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
         parallel_tool_calls: NotGivenOr[bool] = NOT_GIVEN,
         tool_choice: NotGivenOr[ToolChoice] = NOT_GIVEN,
@@ -131,7 +131,14 @@ class LLM(llm.LLM):
             elif tool_choice in ("auto", "required", "none"):
                 oai_tool_choice = tool_choice
                 extra["tool_choice"] = oai_tool_choice
-        logger.info("llm start", extra={"model": self._opts.model})
+        logger.info(
+            "llm chat started",
+            extra={
+                "model": self._opts.model,
+                "provider": "volcengine",
+                "tool_count": len(tools) if tools else 0,
+            },
+        )
         return LLMStream(
             self,
             model=self._opts.model,
@@ -151,7 +158,7 @@ class LLMStream(llm.LLMStream):
         model: str,
         client: openai.AsyncClient,
         chat_ctx: llm.ChatContext,
-        tools: list[FunctionTool],
+        tools: list[Tool],
         conn_options: APIConnectOptions,
         extra_kwargs: dict[str, Any],
     ) -> None:
@@ -191,7 +198,10 @@ class LLMStream(llm.LLMStream):
                             retryable = False
                             self._event_ch.send_nowait(chat_chunk)
                         if first_response:
-                            logger.info("llm first response")
+                            logger.info(
+                                "llm first response",
+                                extra={"model": self._model},
+                            )
                             first_response = False
 
                     if chunk.usage is not None:
@@ -205,11 +215,25 @@ class LLMStream(llm.LLMStream):
                             ),
                         )
                         self._event_ch.send_nowait(chunk)
-            logger.info("llm end")
+            logger.info("llm end", extra={"model": self._model})
 
         except openai.APITimeoutError:
+            logger.error(
+                "llm timeout error",
+                extra={"model": self._model, "error_type": "APITimeoutError", "retryable": retryable},
+            )
             raise APITimeoutError(retryable=retryable)  # noqa: B904
         except openai.APIStatusError as e:
+            logger.error(
+                "llm status error",
+                extra={
+                    "model": self._model,
+                    "error_type": "APIStatusError",
+                    "status_code": e.status_code,
+                    "retryable": retryable,
+                },
+                exc_info=True,
+            )
             raise APIStatusError(  # noqa: B904
                 e.message,
                 status_code=e.status_code,
@@ -218,6 +242,11 @@ class LLMStream(llm.LLMStream):
                 retryable=retryable,
             )
         except Exception as e:
+            logger.error(
+                "llm connection error",
+                extra={"model": self._model, "error_type": type(e).__name__, "retryable": retryable},
+                exc_info=True,
+            )
             raise APIConnectionError(retryable=retryable) from e
 
     def _parse_choice(self, id: str, choice: Choice) -> llm.ChatChunk | None:

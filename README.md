@@ -4,137 +4,192 @@
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](https://opensource.org/licenses/Apache-2.0)
 
-火山引擎服务专用的 [LiveKit Agents](https://github.com/livekit/agents) 插件，提供完整的语音和语言模型集成解决方案。
+[LiveKit Agents](https://github.com/livekit/agents) 火山引擎插件，提供 STT、TTS、LLM 和实时语音模型集成。
 
-## 📦 关于此仓库
+## 功能
 
-这是 `livekit-plugins-volcengine` 包的**原始源代码**（版本 1.3.0），从 PyPI 官方包中提取并重新组织为标准的 Python 包结构。
+| 组件 | 类名 | 说明 |
+|------|------|------|
+| 语音识别 | `STT` | 火山引擎流式语音识别 |
+| 大模型语音识别 | `BigModelSTT` | 火山引擎大模型 ASR，支持更高精度 |
+| 语音合成 | `TTS` | 火山引擎流式语音合成 |
+| 大语言模型 | `LLM` | 豆包大模型，兼容 OpenAI 接口 |
+| 实时语音 | `RealtimeModel` | 端到端实时语音交互 |
 
-- **原始包**: https://pypi.org/project/livekit-plugins-volcengine/
-- **版本**: 1.3.0
-- **作者**: wangmengdi <790990241@qq.com>
-- **许可证**: Apache 2.0
-
-## ✨ 特性
-
-- 🎤 **语音识别 (STT)** - 支持火山引擎语音识别服务
-- 🗣️ **语音合成 (TTS)** - 支持火山引擎文本转语音服务
-- 🤖 **大语言模型 (LLM)** - 支持豆包大模型系列
-- 🎯 **大模型语音识别 (BigModelSTT)** - 增强版语音识别服务
-- ⚡ **实时语音模型 (Realtime)** - 端到端实时语音交互
-- 🔧 **简单集成** - 与 LiveKit Agents 框架无缝集成
-- 📦 **开箱即用** - 完整的 Python 包支持
-
-## 🛠️ 安装
-
-### 从 PyPI 安装（推荐）
+## 安装
 
 ```bash
 pip install livekit-plugins-volcengine
 ```
 
-### 从本仓库安装
+开发安装：
 
 ```bash
-# 克隆仓库
-git clone https://github.com/your-username/livekit-plugins-volcengine.git
+git clone https://github.com/AIOps-Lab-NKU/livekit-plugins-volcengine.git
 cd livekit-plugins-volcengine
-
-# 安装
 pip install -e .
 ```
 
-### 从源码构建
+## 快速开始
 
-```bash
-# 构建包
-python -m build
-
-# 安装构建的包
-pip install dist/livekit_plugins_volcengine-1.3.0-py3-none-any.whl
-```
-
-## 📖 使用方法
-
-安装后，可以像使用官方包一样导入：
+### STT (语音识别)
 
 ```python
-from livekit.plugins import volcengine
+from livekit.plugins.volcengine import STT, BigModelSTT
 
-# 使用实时语音模型
-llm = volcengine.RealtimeModel(
+# 标准 STT
+stt = STT(
+    app_id="your_app_id",
+    cluster="your_cluster",
+    access_token="your_access_token",
+)
+
+# 大模型 STT (推荐)
+stt = BigModelSTT(
     app_id="your_app_id",
     access_token="your_access_token",
-    bot_name="智能助手",
-    model="O"
+    model_name="bigmodel",
+    enable_punc=True,
 )
 ```
 
-详细使用文档请参考 [火山引擎官方文档](https://www.volcengine.com/docs/6561/1594356)。
+### TTS (语音合成)
 
-## 📁 项目结构
+```python
+from livekit.plugins.volcengine import TTS
 
-```
-livekit-plugins-volcengine/
-├── livekit/
-│   └── plugins/
-│       └── volcengine/
-│           ├── __init__.py          # 包初始化
-│           ├── bigmodel_stt.py      # 大模型语音识别
-│           ├── llm.py               # 大语言模型集成
-│           ├── realtime.py          # 实时语音模型
-│           ├── stt.py               # 标准语音识别
-│           ├── tts.py               # 语音合成
-│           ├── utils.py             # 工具函数
-│           ├── version.py           # 版本信息
-│           └── py.typed             # 类型标注
-├── pyproject.toml                   # 包配置
-├── README.md                        # 说明文档
-└── LICENSE                          # 许可证
-
+tts = TTS(
+    app_id="your_app_id",
+    cluster="volcano_tts",
+    access_token="your_access_token",
+    voice="BV001_V2_streaming",  # 音色
+    sample_rate=24000,
+)
 ```
 
-## 🔍 代码来源验证
+### LLM (大语言模型)
 
-此仓库中的代码是从 PyPI 官方包中提取的原始代码：
+```python
+from livekit.plugins.volcengine import LLM
 
-1. 使用 `pip download livekit-plugins-volcengine` 下载官方 wheel 包
-2. 解压 wheel 包提取源代码
-3. 重新组织为标准 Python 包结构
-4. 添加构建配置文件（`pyproject.toml`）
+# 豆包大模型
+llm = LLM(
+    model="doubao-1-5-lite-32k-250115",
+    api_key="your_api_key",
+    base_url="https://ark.cn-beijing.volces.com/api/v3/",
+)
 
-**代码完全未修改**，只是调整了目录结构以支持从源码安装。
-
-## ⚙️ 系统要求
-
-- Python >= 3.9
-- LiveKit Agents == 1.2.9
-
-## 📝 依赖项
-
-```
-livekit-agents==1.2.9
-numpy
-openai>=1.75.0
-osc-data==0.2.2
-pydantic
+# 兼容 OpenAI 接口的其他模型
+llm = LLM(
+    model="qwen3-max",
+    api_key="your_api_key",
+    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+)
 ```
 
-## 🤝 贡献
+### RealtimeModel (实时语音)
 
-欢迎提交 Issue 和 Pull Request！
+```python
+from livekit.plugins.volcengine import RealtimeModel
 
-## 📄 许可证
+realtime = RealtimeModel(
+    app_id="your_app_id",
+    access_token="your_access_token",
+    bot_name="智能助手",
+)
+```
 
-本项目采用 Apache 2.0 许可证 - 查看 [LICENSE](LICENSE) 文件了解详情。
+### 与 LiveKit Agent 集成
 
-## 📞 联系方式
+```python
+from livekit.agents import AgentSession, Agent
+from livekit.plugins import volcengine, silero
 
-- 原作者邮箱: 790990241@qq.com
-- PyPI 包: https://pypi.org/project/livekit-plugins-volcengine/
+session = AgentSession(
+    vad=silero.VAD.load(),
+    stt=volcengine.BigModelSTT(
+        app_id="your_app_id",
+        access_token="your_access_token",
+    ),
+    llm=volcengine.LLM(
+        model="doubao-1-5-lite-32k-250115",
+        api_key="your_api_key",
+    ),
+    tts=volcengine.TTS(
+        app_id="your_app_id",
+        cluster="volcano_tts",
+        access_token="your_access_token",
+    ),
+)
+```
 
-## 🙏 致谢
+## 环境变量
 
-- [LiveKit](https://github.com/livekit/agents) - 优秀的实时通信框架
-- [火山引擎](https://www.volcengine.com/) - 强大的AI服务提供商
-- 原作者 wangmengdi - 开发并维护此插件
+可通过环境变量配置凭证：
+
+```bash
+# STT
+export VOLCENGINE_STT_ACCESS_TOKEN="your_access_token"
+export VOLCENGINE_STT_APP_ID="your_app_id"
+
+# TTS
+export VOLCENGINE_TTS_ACCESS_TOKEN="your_access_token"
+
+# LLM
+export VOLCENGINE_LLM_API_KEY="your_api_key"
+```
+
+## API 参考
+
+### BigModelSTT 参数
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `app_id` | str | - | 应用 ID |
+| `access_token` | str | - | Access Token |
+| `model_name` | str | `"bigmodel"` | 模型名称 |
+| `enable_punc` | bool | `True` | 启用标点 |
+| `enable_itn` | bool | `False` | 启用文本规范化 |
+| `enable_ddc` | bool | `False` | 启用语义顺滑 |
+| `vad_segment_duration` | int | `3000` | VAD 分句时长 (ms) |
+| `end_window_size` | int | `500` | 静音判停时长 (ms) |
+
+### TTS 参数
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `app_id` | str | - | 应用 ID |
+| `cluster` | str | - | 集群名称 |
+| `access_token` | str | - | Access Token |
+| `voice` | str | `"BV001_V2_streaming"` | 音色 |
+| `sample_rate` | int | `16000` | 采样率 |
+| `speed` | float | `1.0` | 语速 (0.2-3.0) |
+| `volume` | float | `1.0` | 音量 (0.1-3.0) |
+| `pitch` | float | `1.0` | 音调 (0.1-3.0) |
+
+### LLM 参数
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `model` | str | `"doubao-1-5-lite-32k-250115"` | 模型名称 |
+| `api_key` | str | - | API Key |
+| `base_url` | str | 豆包 API | API 地址 |
+| `temperature` | float | - | 温度参数 |
+| `tool_choice` | str | - | 工具选择策略 |
+
+## 依赖
+
+- `livekit-agents ~= 1.4.4`
+- `numpy`
+- `openai >= 1.75.0`
+- `pydantic`
+
+## 相关链接
+
+- [LiveKit Agents 文档](https://docs.livekit.io/agents/)
+- [火山引擎语音技术](https://www.volcengine.com/docs/6561/1594356)
+- [豆包大模型](https://www.volcengine.com/docs/82379/1099455)
+
+## 许可证
+
+Apache 2.0
