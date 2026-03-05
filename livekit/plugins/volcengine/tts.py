@@ -5,6 +5,7 @@ import gzip
 import json
 import os
 import time
+import weakref
 from collections.abc import ByteString
 from typing import Literal, Tuple
 
@@ -14,6 +15,9 @@ from osc_data.text_stream import TextStreamSentencizer
 
 from livekit.agents import (
     APIConnectOptions,
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
     tts,
     utils,
 )
@@ -111,7 +115,7 @@ class TTS(tts.TTS):
             http_session (aiohttp.ClientSession | None, optional): the http session to use. Defaults to None.
         """
         super().__init__(
-            capabilities=tts.TTSCapabilities(streaming=True),
+            capabilities=tts.TTSCapabilities(streaming=True, aligned_transcript=False),
             sample_rate=sample_rate,
             num_channels=1,
         )
@@ -135,11 +139,33 @@ class TTS(tts.TTS):
             max_session_duration=30,  # 火山ws30s会自动关闭，所以至少30s以内自动建立新的连接。
             mark_refreshed_on_get=False,
         )
+        self._streams: weakref.WeakSet[SynthesizeStream] = weakref.WeakSet()
 
     def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is None:
             self._session = utils.http_context.http_session()
         return self._session
+
+    @property
+    def model(self) -> str:
+        """返回当前使用的语音类型"""
+        return self._opts.voice
+
+    @property
+    def provider(self) -> str:
+        """返回提供商名称"""
+        return "volcengine"
+
+    def prewarm(self) -> None:
+        """预热 HTTP 会话，减少首次请求延迟"""
+        self._ensure_session()
+
+    async def aclose(self) -> None:
+        """关闭所有流和连接池"""
+        for stream in list(self._streams):
+            await stream.aclose()
+        self._streams.clear()
+        await self._pool.aclose()
 
     async def _connect_ws(self, timeout: float) -> aiohttp.ClientWebSocketResponse:
         session = self._ensure_session()
@@ -156,16 +182,21 @@ class TTS(tts.TTS):
     def synthesize(
         self, text, *, conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS
     ):
-        raise NotImplementedError
+        raise NotImplementedError(
+            "Volcengine TTS does not support non-streaming synthesis. "
+            "Use stream() for streaming synthesis instead."
+        )
 
     def stream(self, *, conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS):
-        return SynthesizeStream(
+        stream = SynthesizeStream(
             tts=self,
             conn_options=conn_options,
             opts=self._opts,
             pool=self._pool,
             session=self._ensure_session(),
         )
+        self._streams.add(stream)
+        return stream
 
 
 class SynthesizeStream(tts.SynthesizeStream):
@@ -195,6 +226,16 @@ class SynthesizeStream(tts.SynthesizeStream):
             frame_size_ms=200,
             stream=True,
         )
+        logger.debug(
+            "tts synthesis started",
+            extra={
+                "request_id": request_id,
+                "model": self._tts.model,
+                "provider": self._tts.provider,
+                "voice": self._opts.voice,
+                "sample_rate": self._opts.sample_rate,
+            },
+        )
 
         async def _send_task(sentence: str, ws: aiohttp.ClientWebSocketResponse):
             if len(sentence) > 0:
@@ -216,46 +257,79 @@ class SynthesizeStream(tts.SynthesizeStream):
                         elapsed_time = time.perf_counter() - start_time
                         logger.info(
                             "tts first response",
-                            extra={"spent": round(elapsed_time, 4)},
+                            extra={
+                                "request_id": request_id,
+                                "spent": round(elapsed_time, 4),
+                            },
                         )
                         is_first_response = False
                     emitter.push(data=data)
                 if done:
                     break
 
-        is_first_sentence = True
-        start = time.perf_counter()
-        async for token in self._input_ch:
-            if isinstance(token, self._FlushSentinel):
-                sentences = sentence_splitter.flush()
-            else:
-                sentences = sentence_splitter.push(text=token)
-            for sentence in sentences:
-                if len(sentence.strip()) == 0:
-                    continue
-                if is_first_sentence:
-                    is_first_sentence = False
-                    elapsed_time = time.perf_counter() - start
+        try:
+            is_first_sentence = True
+            start = time.perf_counter()
+            async for token in self._input_ch:
+                if isinstance(token, self._FlushSentinel):
+                    sentences = sentence_splitter.flush()
+                else:
+                    sentences = sentence_splitter.push(text=token)
+                for sentence in sentences:
+                    if len(sentence.strip()) == 0:
+                        continue
+                    if is_first_sentence:
+                        is_first_sentence = False
+                        elapsed_time = time.perf_counter() - start
+                        logger.info(
+                            "llm first sentence",
+                            extra={"spent": round(elapsed_time, 4)},
+                        )
                     logger.info(
-                        "llm first sentence", extra={"spent": round(elapsed_time, 4)}
+                        "tts start",
+                        extra={
+                            "request_id": request_id,
+                            "sentence": sentence,
+                        },
                     )
-                logger.info("tts start", extra={"sentence": sentence})
-                emitter.start_segment(segment_id=utils.shortuuid())
-                async with self._tts._pool.connection(
-                    timeout=self._conn_options.timeout
-                ) as ws:
-                    assert not ws.closed, "WebSocket connection is closed"
-                    tasks = [
-                        asyncio.create_task(_send_task(sentence=sentence, ws=ws)),
-                        asyncio.create_task(_recv_task(ws=ws)),
-                    ]
-                    try:
-                        await asyncio.gather(*tasks)
-                    finally:
-                        await utils.aio.gracefully_cancel(*tasks)
-                emitter.end_segment()
-                logger.info("tts end")
-                self._pushed_text = self._pushed_text.replace(sentence, "")
+                    emitter.start_segment(segment_id=utils.shortuuid())
+                    async with self._tts._pool.connection(
+                        timeout=self._conn_options.timeout
+                    ) as ws:
+                        assert not ws.closed, "WebSocket connection is closed"
+                        tasks = [
+                            asyncio.create_task(
+                                _send_task(sentence=sentence, ws=ws)
+                            ),
+                            asyncio.create_task(_recv_task(ws=ws)),
+                        ]
+                        try:
+                            await asyncio.gather(*tasks)
+                        finally:
+                            await utils.aio.gracefully_cancel(*tasks)
+                    emitter.end_segment()
+                    logger.info("tts end", extra={"request_id": request_id})
+                    self._pushed_text = self._pushed_text.replace(sentence, "")
+        except asyncio.TimeoutError:
+            logger.error(
+                "tts timeout error",
+                extra={"request_id": request_id, "error_type": "TimeoutError", "retryable": True},
+            )
+            raise APITimeoutError(retryable=True)
+        except aiohttp.ClientError as e:
+            logger.error(
+                "tts connection error",
+                extra={"request_id": request_id, "error_type": type(e).__name__, "retryable": True},
+                exc_info=True,
+            )
+            raise APIConnectionError(retryable=True) from e
+        except Exception as e:
+            logger.error(
+                "tts unexpected error",
+                extra={"request_id": request_id, "error_type": type(e).__name__, "retryable": False},
+                exc_info=True,
+            )
+            raise APIConnectionError(retryable=False) from e
 
 
 def parse_response(res) -> Tuple[bool, ByteString | None]:

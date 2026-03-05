@@ -13,6 +13,7 @@ from openai.types.chat import (
 )
 
 from livekit.agents import llm
+from livekit.agents.llm import Tool
 
 AsyncAzureADTokenProvider = Callable[[], Union[str, Awaitable[str]]]
 
@@ -25,7 +26,7 @@ def get_base_url(base_url: str | None) -> str:
     return base_url
 
 
-def to_fnc_ctx(fnc_ctx: list[llm.FunctionTool]) -> list[ChatCompletionToolParam]:
+def to_fnc_ctx(fnc_ctx: list[Tool]) -> list[ChatCompletionToolParam]:
     return [llm.utils.build_strict_openai_schema(fnc) for fnc in fnc_ctx]
 
 

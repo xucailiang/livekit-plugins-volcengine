@@ -290,14 +290,16 @@ class RealtimeModel(llm.RealtimeModel):
                 manual_function_calls=True,
             )
         )
-        logger.info(f"Model: {model}")
-        logger.info(f"Character Manifest: {character_manifest}")
-        logger.info(f"End Smooth Window MS: {end_smooth_window_ms}")
-        logger.info(f"Enable Volc Websearch: {enable_volc_websearch}")
-        logger.info(f"Volc Websearch Type: {volc_websearch_type}")
-        logger.info(f"Volc Websearch API Key: {volc_websearch_api_key}")
         logger.info(
-            f"Volc Websearch No Result Message: {volc_websearch_no_result_message}"
+            "realtime model initialized",
+            extra={
+                "model": model,
+                "provider": "volcengine",
+                "speaker": speaker,
+                "character_manifest": character_manifest,
+                "end_smooth_window_ms": end_smooth_window_ms,
+                "enable_volc_websearch": enable_volc_websearch,
+            },
         )
         app_id = app_id or os.environ.get("VOLCENGINE_REALTIME_APP_ID")
         if app_id is None:
@@ -330,6 +332,15 @@ class RealtimeModel(llm.RealtimeModel):
         self._http_session = http_session
         self._sessions = weakref.WeakSet[RealtimeSession]()
 
+    @property
+    def provider(self) -> str:
+        """返回提供商名称"""
+        return "volcengine"
+
+    def prewarm(self) -> None:
+        """预热 HTTP 会话，减少首次请求延迟"""
+        self._ensure_http_session()
+
     def update_options(
         self,
         *,
@@ -348,7 +359,14 @@ class RealtimeModel(llm.RealtimeModel):
         self._sessions.add(sess)
         return sess
 
-    async def aclose(self) -> None: ...
+    async def aclose(self) -> None:
+        """关闭所有活跃会话和 HTTP 会话"""
+        for session in list(self._sessions):
+            await session.aclose()
+
+        if self._http_session and not self._http_session.closed:
+            await self._http_session.close()
+            self._http_session = None
 
 
 class RealtimeSession(
@@ -414,7 +432,14 @@ class RealtimeSession(
 
     @utils.log_exceptions(logger=logger)
     async def _main_task(self) -> None:
-        logger.info("start realtime main task")
+        logger.info(
+            "realtime session started",
+            extra={
+                "session_id": self.session_id,
+                "model": self._realtime_model._opts.model,
+                "provider": "volcengine",
+            },
+        )
         # while not self._msg_ch.closed:
         ws_conn = await self._create_ws_conn()
 
@@ -422,10 +447,20 @@ class RealtimeSession(
             await self._run_ws(ws_conn)
 
         except Exception as e:
-            logger.error("realtime main task error", exc_info=e)
+            logger.error(
+                "realtime session error",
+                extra={
+                    "session_id": self.session_id,
+                    "error_type": type(e).__name__,
+                },
+                exc_info=True,
+            )
             self._emit_error(e, recoverable=False)
             raise e
-        logger.info("realtime main task break")
+        logger.info(
+            "realtime session ended",
+            extra={"session_id": self.session_id},
+        )
         # break
 
     async def _create_ws_conn(self) -> aiohttp.ClientWebSocketResponse:
@@ -788,13 +823,26 @@ class RealtimeSession(
         tool_choice: NotGivenOr[llm.ToolChoice | None] = NOT_GIVEN,
         voice: NotGivenOr[str] = NOT_GIVEN,
     ) -> None:
-        pass
+        """更新会话选项"""
+        if utils.is_given(voice):
+            self._opts.speaker = voice
+            logger.debug("voice updated", extra={"voice": voice})
+        if utils.is_given(tool_choice):
+            logger.debug("tool_choice update requested but not supported")
 
-    async def update_tools(self, tools):
-        pass
+    async def update_tools(self, tools: llm.ToolContext) -> None:
+        """更新工具上下文"""
+        async with self._update_fnc_ctx_lock:
+            self._tools = tools.copy()
+            logger.debug("tools updated", extra={"tool_count": len(tools)})
 
     async def update_chat_ctx(self, chat_ctx: llm.ChatContext) -> None:
-        pass
+        """更新聊天上下文"""
+        async with self._update_chat_ctx_lock:
+            # 火山引擎实时接口当前不支持动态更新聊天上下文
+            logger.debug(
+                "update_chat_ctx called but not fully supported by volcengine realtime API"
+            )
 
     def _create_update_chat_ctx_events(self, chat_ctx: llm.ChatContext):
         events = []
@@ -812,6 +860,8 @@ class RealtimeSession(
                 self._pushed_duration_s += nf.duration
 
     def push_video(self, frame: rtc.VideoFrame) -> None:
+        """推送视频帧（当前不支持）"""
+        # 火山引擎实时接口当前不支持视频输入
         pass
 
     def commit_audio(self) -> None:
@@ -838,7 +888,11 @@ class RealtimeSession(
         return fut
 
     def interrupt(self) -> None:
-        pass
+        """中断当前生成"""
+        # 火山引擎实时接口当前不支持中断
+        logger.debug(
+            "interrupt called but not fully supported by volcengine realtime API"
+        )
 
     def truncate(
         self,
