@@ -9,6 +9,7 @@ __pycache__/
 .kiro/
 *.wav
 *.mp3
+test_*
 
 # Distribution / packaging
 .Python

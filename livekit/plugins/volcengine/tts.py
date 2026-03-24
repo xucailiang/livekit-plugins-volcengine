@@ -37,6 +37,8 @@ class _TTSOptions(BaseModel):
     speed: float = Field(1.0, ge=0.2, le=3.0)
     volume: float = Field(1.0, gt=0.1, le=3.0)
     pitch: float = Field(1.0, ge=0.1, le=3.0)
+    language: str | None = None
+    explicit_language: str | None = None
 
     def get_ws_url(self):
         return f"{self.base_url}/tts/ws_binary"
@@ -58,6 +60,8 @@ class _TTSOptions(BaseModel):
                 "volume_ratio": self.volume,
                 "pitch_ratio": self.pitch,
                 "rate": self.sample_rate,
+                **({"language": self.language} if self.language else {}),
+                **({"explicit_language": self.explicit_language} if self.explicit_language else {}),
             },
             "request": {
                 "reqid": utils.shortuuid(),
@@ -97,6 +101,8 @@ class TTS(tts.TTS):
         cluster: str,
         access_token: str | None = None,
         voice: str = "BV001_V2_streaming",
+        language: str | None = None,
+        explicit_language: str | None = None,
         speed: float = 1.0,
         volume: float = 1.0,
         pitch: float = 1.0,
@@ -110,6 +116,8 @@ class TTS(tts.TTS):
             cluster (str): the cluster of the tts, you can get it from the console.
             access_token (str | None, optional): the access token of the tts, if not provided, the value of the environment variable VOLCENGINE_TTS_ACCESS_TOKEN will be used. Defaults to None.
             voice_type (str, optional): the voice type of the tts, you can get it from https://www.volcengine.com/docs/6561/97465. Defaults to "BV001_V2_streaming". if you want to use the streaming api, you must ensure the voice type is end with "_streaming".
+            language (str | None, optional): the dialect for TTS synthesis. Only effective for voices that support multi-dialect (e.g. BV704_streaming). Examples: "zh_yueyu" (Cantonese), "zh_dongbei" (Northeastern), "zh_chengdu" (Chengdu), "zh_shanghai" (Shanghai), etc. See https://www.volcengine.com/docs/6561/97465 for supported values. Defaults to None.
+            explicit_language (str | None, optional): the explicit language for TTS synthesis. Controls which language the text is read in. Examples: "zh-cn" (Chinese), "en" (English), "ja" (Japanese), etc. Defaults to None.
             sample_rate (Literal[24000, 16000, 8000], optional): the sample rate of the tts. Defaults to 24000.
             streaming (bool, optional): whether to use the streaming api. Defaults to True.
             http_session (aiohttp.ClientSession | None, optional): the http session to use. Defaults to None.
@@ -124,6 +132,8 @@ class TTS(tts.TTS):
             cluster=cluster,
             access_token=access_token,
             voice=voice,
+            language=language,
+            explicit_language=explicit_language,
             sample_rate=sample_rate,
             speed=speed,
             volume=volume,

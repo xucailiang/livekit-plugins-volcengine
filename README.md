@@ -58,6 +58,7 @@ stt = BigModelSTT(
 ```python
 from livekit.plugins.volcengine import TTS
 
+# 基础用法 - 普通话
 tts = TTS(
     app_id="your_app_id",
     cluster="volcano_tts",
@@ -65,7 +66,53 @@ tts = TTS(
     voice="BV001_V2_streaming",  # 音色
     sample_rate=24000,
 )
+
+# 粤语合成 - 需要使用方言灿灿音色(BV704_streaming) + language 参数
+tts = TTS(
+    app_id="your_app_id",
+    cluster="volcano_tts",
+    access_token="your_access_token",
+    voice="BV704_streaming",     # 方言灿灿，支持多方言
+    language="zh_yueyu",         # 粤语
+    sample_rate=24000,
+)
+
+# 多语种合成 - 使用支持多语种的音色 + explicit_language 参数
+tts = TTS(
+    app_id="your_app_id",
+    cluster="volcano_tts",
+    access_token="your_access_token",
+    voice="BV700_streaming",     # 灿灿，支持多语种
+    explicit_language="en",      # 仅英文
+    sample_rate=24000,
+)
 ```
+
+支持的方言（`language` 参数，需配合 `BV704_streaming` 音色）：
+
+| 值 | 方言 |
+|----|------|
+| `cn` | 中文普通话 |
+| `zh_dongbei` | 东北话 |
+| `zh_yueyu` | 粤语 |
+| `zh_shanghai` | 上海话 |
+| `zh_xian` | 西安话 |
+| `zh_chengdu` | 成都话 |
+| `zh_taipu` | 台湾普通话 |
+| `zh_guangxi` | 广西普通话 |
+
+支持的语种（`explicit_language` 参数，需配合支持多语种的音色如 `BV700_streaming`、`BV421_streaming` 等）：
+
+| 值 | 语种 |
+|----|------|
+| `zh-cn` | 中文为主，支持中英混 |
+| `en` | 仅英文 |
+| `ja` | 仅日文 |
+| `es-mx` | 仅墨西哥西语 |
+| `id` | 仅印尼语 |
+| `pt-br` | 仅巴西葡语 |
+
+> 完整音色列表及各音色支持的方言/语种详见 [火山引擎音色列表](https://www.volcengine.com/docs/6561/97465)
 
 ### LLM (大语言模型)
 
@@ -123,6 +170,32 @@ session = AgentSession(
 )
 ```
 
+#### 粤语语音助手示例
+
+```python
+from livekit.agents import AgentSession, Agent
+from livekit.plugins import volcengine, silero
+
+session = AgentSession(
+    vad=silero.VAD.load(),
+    stt=volcengine.BigModelSTT(
+        app_id="your_app_id",
+        access_token="your_access_token",
+    ),
+    llm=volcengine.LLM(
+        model="doubao-1-5-lite-32k-250115",
+        api_key="your_api_key",
+    ),
+    tts=volcengine.TTS(
+        app_id="your_app_id",
+        cluster="volcano_tts",
+        access_token="your_access_token",
+        voice="BV704_streaming",  # 方言灿灿
+        language="zh_yueyu",      # 粤语
+    ),
+)
+```
+
 ## 环境变量
 
 可通过环境变量配置凭证：
@@ -161,7 +234,9 @@ export VOLCENGINE_LLM_API_KEY="your_api_key"
 | `app_id` | str | - | 应用 ID |
 | `cluster` | str | - | 集群名称 |
 | `access_token` | str | - | Access Token |
-| `voice` | str | `"BV001_V2_streaming"` | 音色 |
+| `voice` | str | `"BV001_V2_streaming"` | 音色，详见[音色列表](https://www.volcengine.com/docs/6561/97465) |
+| `language` | str \| None | `None` | 方言，需配合支持多方言的音色（如 `BV704_streaming`）。如 `zh_yueyu`（粤语）、`zh_dongbei`（东北话）等 |
+| `explicit_language` | str \| None | `None` | 明确语种，需配合支持多语种的音色。如 `en`（英文）、`ja`（日文）等 |
 | `sample_rate` | int | `16000` | 采样率 |
 | `speed` | float | `1.0` | 语速 (0.2-3.0) |
 | `volume` | float | `1.0` | 音量 (0.1-3.0) |
