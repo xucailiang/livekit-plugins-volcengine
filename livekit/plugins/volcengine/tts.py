@@ -5,18 +5,16 @@ import gzip
 import json
 import os
 import time
+import uuid
 import weakref
-from collections.abc import ByteString
-from typing import Literal, Tuple
+from typing import Literal
 
 import aiohttp
-from pydantic import BaseModel, Field
 from osc_data.text_stream import TextStreamSentencizer
 
 from livekit.agents import (
     APIConnectOptions,
     APIConnectionError,
-    APIStatusError,
     APITimeoutError,
     tts,
     utils,
@@ -25,130 +23,153 @@ from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS
 
 from .log import logger
 
+PROTOCOL_VERSION = 0b0001
+DEFAULT_HEADER_SIZE = 0b0001
 
-class _TTSOptions(BaseModel):
-    app_id: str
-    cluster: str
-    access_token: str | None = None
-    voice: str = "BV001_V2_streaming"
-    base_url: str = "wss://openspeech.bytedance.com/api/v1"
-    sample_rate: Literal[24000, 16000, 8000] = 24000
-    encoding: Literal["mp3", "pcm"] = "pcm"
-    speed: float = Field(1.0, ge=0.2, le=3.0)
-    volume: float = Field(1.0, gt=0.1, le=3.0)
-    pitch: float = Field(1.0, ge=0.1, le=3.0)
-    language: str | None = None
-    explicit_language: str | None = None
+CLIENT_FULL_REQUEST = 0b0001
+SERVER_FULL_RESPONSE = 0b1001
+SERVER_ERROR_RESPONSE = 0b1111
 
-    def get_ws_url(self):
-        return f"{self.base_url}/tts/ws_binary"
+MSG_WITH_EVENT = 0b0100
+JSON_SERIAL = 0b0001
+GZIP_COMPRESS = 0b0001
 
-    def get_ws_query_params(self, text: str, uid: str | None = None) -> bytearray:
-        if uid is None:
-            uid = utils.shortuuid()
-        submit_request_json = {
-            "app": {
-                "appid": self.app_id,
-                "token": self.access_token,
-                "cluster": self.cluster,
-            },
-            "user": {"uid": uid},
-            "audio": {
-                "voice_type": self.voice,
-                "encoding": self.encoding,
-                "speed_ratio": self.speed,
-                "volume_ratio": self.volume,
-                "pitch_ratio": self.pitch,
-                "rate": self.sample_rate,
-                **({"language": self.language} if self.language else {}),
-                **({"explicit_language": self.explicit_language} if self.explicit_language else {}),
-            },
-            "request": {
-                "reqid": utils.shortuuid(),
-                "text": text,
-                "text_type": "plain",
-                "operation": "submit",
-                "with_frontend": 1,
-                "frontend_type": "unitTson",
-            },
-        }
-        default_header = bytearray(b"\x11\x10\x11\x00")
-        payload_bytes = str.encode(json.dumps(submit_request_json))
-        payload_bytes = gzip.compress(
-            payload_bytes
-        )  # if no compression, comment this line
-        full_client_request = bytearray(default_header)
-        full_client_request.extend(
-            (len(payload_bytes)).to_bytes(4, "big")
-        )  # payload size(4 bytes)
-        full_client_request.extend(payload_bytes)  # payload
-        return full_client_request
+EVENT_START_CONNECTION = 1
+EVENT_FINISH_CONNECTION = 2
+EVENT_START_SESSION = 100
+EVENT_FINISH_SESSION = 102
+EVENT_TASK_REQUEST = 200
 
-    def get_ws_header(self):
-        if self.access_token is None:
-            self.access_token = os.getenv("VOLCENGINE_TTS_ACCESS_TOKEN")
-            if self.access_token is None:
-                raise ValueError("VOLCENGINE_TTS_ACCESS_TOKEN is not set")
-        return {
-            "Authorization": f"Bearer;{self.access_token}",
-        }
+EVENT_CONNECTION_STARTED = 50
+EVENT_SESSION_STARTED = 150
+EVENT_SESSION_FINISHED = 152
+EVENT_SESSION_FAILED = 153
+EVENT_TTS_RESPONSE = 352
+
+# 方言需走 explicit_dialect，不能填进 explicit_language
+_DIALECTS = {"beijing", "dongbei", "henan", "shaanxi", "shanghai", "sichuan", "tianjin", "yue"}
+
+
+def _build_frame(event: int, payload: dict | None = None, session_id: str = "") -> bytearray:
+    payload_bytes = gzip.compress(b"{}") if payload is None else gzip.compress(
+        str.encode(json.dumps(payload, ensure_ascii=False))
+    )
+    header = bytearray([
+        (PROTOCOL_VERSION << 4) | DEFAULT_HEADER_SIZE,
+        (CLIENT_FULL_REQUEST << 4) | MSG_WITH_EVENT,
+        (JSON_SERIAL << 4) | GZIP_COMPRESS,
+        0,
+    ])
+    frame = bytearray(header)
+    frame.extend(event.to_bytes(4, "big"))
+    if session_id:
+        sid = str.encode(session_id)
+        frame.extend(len(sid).to_bytes(4, "big"))
+        frame.extend(sid)
+    frame.extend(len(payload_bytes).to_bytes(4, "big"))
+    frame.extend(payload_bytes)
+    return frame
+
+
+def _parse_response(res: bytes) -> dict | None:
+    header_size = res[0] & 0x0F
+    message_type = res[1] >> 4
+    message_type_specific_flags = res[1] & 0x0F
+    message_compression = res[2] & 0x0F
+    payload = res[header_size * 4 :]
+
+    if message_type == SERVER_ERROR_RESPONSE:
+        code = int.from_bytes(payload[:4], "big", signed=False)
+        payload_size = int.from_bytes(payload[4:8], "big", signed=False)
+        error_msg = payload[8:8 + payload_size]
+        if message_compression == GZIP_COMPRESS:
+            error_msg = gzip.decompress(error_msg)
+        logger.error("tts server error", extra={"code": code, "error": str(error_msg, "utf-8")})
+        return {"event": 0, "payload": {"error": str(error_msg, "utf-8")}}
+
+    result = {"event": 0, "payload": b""}
+    start = 0
+    if message_type_specific_flags & MSG_WITH_EVENT:
+        result["event"] = int.from_bytes(payload[:4], "big", signed=False)
+        start = 4
+
+    payload = payload[start:]
+    # 连接级事件没有 session_id，session 级事件有
+    sid_size = int.from_bytes(payload[:4], "big", signed=True)
+    if sid_size > 0:
+        result["session_id"] = str(payload[4:4 + sid_size], "utf-8")
+        payload = payload[4 + sid_size:]
+    else:
+        payload = payload[4:]
+
+    if len(payload) < 4:
+        return result
+
+    payload_size = int.from_bytes(payload[:4], "big", signed=False)
+    payload_msg = payload[4:4 + payload_size]
+
+    if result["event"] != EVENT_TTS_RESPONSE and payload_msg:
+        if message_compression == GZIP_COMPRESS:
+            payload_msg = gzip.decompress(payload_msg)
+        payload_msg = json.loads(payload_msg)
+    result["payload"] = payload_msg
+    return result
 
 
 class TTS(tts.TTS):
     def __init__(
         self,
-        app_id: str,
-        cluster: str,
-        access_token: str | None = None,
-        voice: str = "BV001_V2_streaming",
+        *,
+        api_key: str | None = None,
+        resource_id: str = "seed-tts-2.0",
+        speaker: str = "zh_female_vv_uranus_bigtts",
         language: str | None = None,
-        explicit_language: str | None = None,
-        speed: float = 1.0,
-        volume: float = 1.0,
-        pitch: float = 1.0,
-        sample_rate: Literal[24000, 16000, 8000] = 16000,
+        speech_rate: int = 0,
+        loudness_rate: int = 0,
+        sample_rate: int = 24000,
+        output_format: Literal["pcm", "mp3", "ogg_opus"] = "pcm",
+        disable_markdown_filter: bool = False,
+        disable_emoji_filter: bool = False,
         http_session: aiohttp.ClientSession | None = None,
     ):
-        """VolcEngine TTS
+        """火山引擎豆包语音合成 v3 (双向流式 WebSocket)
+
+        endpoint: wss://openspeech.bytedance.com/api/v3/tts/bidirection
 
         Args:
-            app_id (str): the app id of the tts, you can get it from the console.
-            cluster (str): the cluster of the tts, you can get it from the console.
-            access_token (str | None, optional): the access token of the tts, if not provided, the value of the environment variable VOLCENGINE_TTS_ACCESS_TOKEN will be used. Defaults to None.
-            voice_type (str, optional): the voice type of the tts, you can get it from https://www.volcengine.com/docs/6561/97465. Defaults to "BV001_V2_streaming". if you want to use the streaming api, you must ensure the voice type is end with "_streaming".
-            language (str | None, optional): the dialect for TTS synthesis. Only effective for voices that support multi-dialect (e.g. BV704_streaming). Examples: "zh_yueyu" (Cantonese), "zh_dongbei" (Northeastern), "zh_chengdu" (Chengdu), "zh_shanghai" (Shanghai), etc. See https://www.volcengine.com/docs/6561/97465 for supported values. Defaults to None.
-            explicit_language (str | None, optional): the explicit language for TTS synthesis. Controls which language the text is read in. Examples: "zh-cn" (Chinese), "en" (English), "ja" (Japanese), etc. Defaults to None.
-            sample_rate (Literal[24000, 16000, 8000], optional): the sample rate of the tts. Defaults to 24000.
-            streaming (bool, optional): whether to use the streaming api. Defaults to True.
-            http_session (aiohttp.ClientSession | None, optional): the http session to use. Defaults to None.
+            api_key: API Key，未提供时从 VOLCENGINE_TTS_API_KEY / VOLCENGINE_API_KEY 读取。
+            resource_id: seed-tts-2.0 / seed-tts-1.0 / seed-icl-2.0 等。
+            speaker: 音色 ID。2.0 以 _uranus_bigtts 结尾。
+            language: 合成语种/方言。如 "yue"(粤语), "zh-cn"(中文), "en"(英语), "ja"(日语), "sichuan"(四川话) 等。
+            speech_rate: 语速 [-50, 100]，0 为正常，100=2倍速。
+            loudness_rate: 音量 [-50, 100]，0 为正常。
+            sample_rate: 采样率 (8000-48000)。
+            output_format: pcm / mp3 / ogg_opus，流式推荐 pcm。
         """
         super().__init__(
             capabilities=tts.TTSCapabilities(streaming=True, aligned_transcript=False),
             sample_rate=sample_rate,
             num_channels=1,
         )
-        self._opts = _TTSOptions(
-            app_id=app_id,
-            cluster=cluster,
-            access_token=access_token,
-            voice=voice,
-            language=language,
-            explicit_language=explicit_language,
-            sample_rate=sample_rate,
-            speed=speed,
-            volume=volume,
-            pitch=pitch,
-        )
-        self._session = http_session
 
-        self._pool = utils.ConnectionPool[
-            aiohttp.ClientWebSocketResponse
-        ](
-            connect_cb=self._connect_ws,
-            close_cb=self._close_ws,
-            max_session_duration=30,  # 火山ws30s会自动关闭，所以至少30s以内自动建立新的连接。
-            mark_refreshed_on_get=False,
-        )
+        api_key = api_key or os.environ.get("VOLCENGINE_TTS_API_KEY") or os.environ.get("VOLCENGINE_API_KEY")
+        if api_key is None:
+            raise ValueError(
+                "api_key is required. Pass api_key parameter or set VOLCENGINE_TTS_API_KEY / VOLCENGINE_API_KEY."
+            )
+
+        self._api_key = api_key
+        self._resource_id = resource_id
+        self._speaker = speaker
+        self._language = language
+        self._speech_rate = speech_rate
+        self._loudness_rate = loudness_rate
+        self._output_format = output_format
+        self._disable_markdown_filter = disable_markdown_filter
+        self._disable_emoji_filter = disable_emoji_filter
+        self._sample_rate = sample_rate
+
+        self._session = http_session
         self._streams: weakref.WeakSet[SynthesizeStream] = weakref.WeakSet()
 
     def _ensure_session(self) -> aiohttp.ClientSession:
@@ -158,51 +179,27 @@ class TTS(tts.TTS):
 
     @property
     def model(self) -> str:
-        """返回当前使用的语音类型"""
-        return self._opts.voice
+        return self._speaker
 
     @property
     def provider(self) -> str:
-        """返回提供商名称"""
         return "volcengine"
 
     def prewarm(self) -> None:
-        """预热 HTTP 会话，减少首次请求延迟"""
         self._ensure_session()
 
     async def aclose(self) -> None:
-        """关闭所有流和连接池"""
         for stream in list(self._streams):
             await stream.aclose()
         self._streams.clear()
-        await self._pool.aclose()
 
-    async def _connect_ws(self, timeout: float) -> aiohttp.ClientWebSocketResponse:
-        session = self._ensure_session()
-        url = self._opts.get_ws_url()
-        headers = self._opts.get_ws_header()
-        return await asyncio.wait_for(
-            session.ws_connect(url, headers=headers),
-            timeout=timeout,
-        )
-
-    async def _close_ws(self, ws: aiohttp.ClientWebSocketResponse):
-        await ws.close()
-
-    def synthesize(
-        self, text, *, conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS
-    ):
-        raise NotImplementedError(
-            "Volcengine TTS does not support non-streaming synthesis. "
-            "Use stream() for streaming synthesis instead."
-        )
+    def synthesize(self, text, *, conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS):
+        raise NotImplementedError("Volcengine TTS only supports streaming synthesis. Use stream().")
 
     def stream(self, *, conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS):
         stream = SynthesizeStream(
             tts=self,
             conn_options=conn_options,
-            opts=self._opts,
-            pool=self._pool,
             session=self._ensure_session(),
         )
         self._streams.add(stream)
@@ -213,16 +210,13 @@ class SynthesizeStream(tts.SynthesizeStream):
     def __init__(
         self,
         *,
-        opts: _TTSOptions,
-        session: aiohttp.ClientSession,
-        pool: utils.ConnectionPool[aiohttp.ClientWebSocketResponse],
         tts: TTS,
+        session: aiohttp.ClientSession,
         conn_options=None,
     ):
         super().__init__(tts=tts, conn_options=conn_options)
-        self._opts: _TTSOptions = opts
+        self._tts = tts
         self._session = session
-        self._pool = pool
 
     async def _run(self, emitter: tts.AudioEmitter):
         request_id = utils.shortuuid()
@@ -230,145 +224,132 @@ class SynthesizeStream(tts.SynthesizeStream):
         sentence_splitter = TextStreamSentencizer()
         emitter.initialize(
             request_id=request_id,
-            sample_rate=self._opts.sample_rate,
+            sample_rate=self._tts._sample_rate,
             num_channels=1,
             mime_type="audio/pcm",
             frame_size_ms=200,
             stream=True,
         )
-        logger.debug(
-            "tts synthesis started",
-            extra={
-                "request_id": request_id,
-                "model": self._tts.model,
-                "provider": self._tts.provider,
-                "voice": self._opts.voice,
-                "sample_rate": self._opts.sample_rate,
-            },
+
+        logger.debug("tts synthesis started", extra={
+            "request_id": request_id,
+            "speaker": self._tts._speaker,
+            "sample_rate": self._tts._sample_rate,
+        })
+
+        ws = await asyncio.wait_for(
+            self._session.ws_connect(
+                "wss://openspeech.bytedance.com/api/v3/tts/bidirection",
+                headers={
+                    "X-Api-Key": self._tts._api_key,
+                    "X-Api-Resource-Id": self._tts._resource_id,
+                    "X-Api-Connect-Id": str(uuid.uuid4()),
+                },
+            ),
+            self._conn_options.timeout,
         )
 
-        async def _send_task(sentence: str, ws: aiohttp.ClientWebSocketResponse):
-            if len(sentence) > 0:
-                data = self._opts.get_ws_query_params(text=sentence)
-                await ws.send_bytes(data)
-
-        async def _recv_task(ws: aiohttp.ClientWebSocketResponse):
-            is_first_response = True
-            start_time = time.perf_counter()
-            while True:
-                try:
-                    res = await ws.receive_bytes()
-                except Exception as e:
-                    logger.warning(f"Error while receiving bytes: {e}")
-                    break
-                done, data = parse_response(res)
-                if data is not None:
-                    if is_first_response:
-                        elapsed_time = time.perf_counter() - start_time
-                        logger.info(
-                            "tts first response",
-                            extra={
-                                "request_id": request_id,
-                                "spent": round(elapsed_time, 4),
-                            },
-                        )
-                        is_first_response = False
-                    emitter.push(data=data)
-                if done:
-                    break
-
+        session_id = str(uuid.uuid4())
         try:
-            is_first_sentence = True
-            start = time.perf_counter()
-            async for token in self._input_ch:
-                if isinstance(token, self._FlushSentinel):
-                    sentences = sentence_splitter.flush()
+            await ws.send_bytes(_build_frame(EVENT_START_CONNECTION))
+            resp = _parse_response(await ws.receive_bytes())
+            if resp is None or resp.get("event") != EVENT_CONNECTION_STARTED:
+                raise APIConnectionError("failed to start TTS connection")
+
+            additions = {}
+            if self._tts._language:
+                if self._tts._language in _DIALECTS:
+                    additions["explicit_dialect"] = self._tts._language
                 else:
-                    sentences = sentence_splitter.push(text=token)
-                for sentence in sentences:
-                    if len(sentence.strip()) == 0:
-                        continue
-                    if is_first_sentence:
-                        is_first_sentence = False
-                        elapsed_time = time.perf_counter() - start
-                        logger.info(
-                            "llm first sentence",
-                            extra={"spent": round(elapsed_time, 4)},
-                        )
-                    logger.info(
-                        "tts start",
-                        extra={
-                            "request_id": request_id,
-                            "sentence": sentence,
-                        },
-                    )
-                    emitter.start_segment(segment_id=utils.shortuuid())
-                    async with self._tts._pool.connection(
-                        timeout=self._conn_options.timeout
-                    ) as ws:
-                        assert not ws.closed, "WebSocket connection is closed"
-                        tasks = [
-                            asyncio.create_task(
-                                _send_task(sentence=sentence, ws=ws)
-                            ),
-                            asyncio.create_task(_recv_task(ws=ws)),
-                        ]
-                        try:
-                            await asyncio.gather(*tasks)
-                        finally:
-                            await utils.aio.gracefully_cancel(*tasks)
-                    emitter.end_segment()
-                    logger.info("tts end", extra={"request_id": request_id})
-                    self._pushed_text = self._pushed_text.replace(sentence, "")
+                    additions["explicit_language"] = self._tts._language
+            if self._tts._disable_markdown_filter:
+                additions["disable_markdown_filter"] = True
+            if self._tts._disable_emoji_filter:
+                additions["disable_emoji_filter"] = True
+
+            # 官方协议：所有合成参数必须包在 req_params 里，否则 speaker 不生效，
+            # 服务端会报 "resource ID is mismatched with speaker related resource"
+            req_params = {
+                "speaker": self._tts._speaker,
+                "audio_params": {
+                    "format": self._tts._output_format,
+                    "sample_rate": self._tts._sample_rate,
+                    "speech_rate": self._tts._speech_rate,
+                    "loudness_rate": self._tts._loudness_rate,
+                },
+            }
+            if additions:
+                req_params["additions"] = json.dumps(additions, ensure_ascii=False)
+            start_req = {"req_params": req_params}
+
+            await ws.send_bytes(_build_frame(EVENT_START_SESSION, start_req, session_id))
+            resp = _parse_response(await ws.receive_bytes())
+            if resp is None or resp.get("event") != EVENT_SESSION_STARTED:
+                raise APIConnectionError(f"failed to start TTS session: {resp}")
+
+            # 官方协议：逐句发送 TaskRequest，全部发完后再发 FinishSession，
+            # 服务端才会回 TTSSentenceEnd / SessionFinished；边发边读避免音频积压
+            async def _send_text():
+                start = time.perf_counter()
+                first = True
+                async for token in self._input_ch:
+                    if isinstance(token, self._FlushSentinel):
+                        sentences = sentence_splitter.flush()
+                    else:
+                        sentences = sentence_splitter.push(text=token)
+                    for sentence in sentences:
+                        if not sentence.strip():
+                            continue
+                        if first:
+                            first = False
+                            logger.info("llm first sentence", extra={"spent": round(time.perf_counter() - start, 4)})
+                        await ws.send_bytes(_build_frame(
+                            EVENT_TASK_REQUEST, {"req_params": {"text": sentence}}, session_id
+                        ))
+                await ws.send_bytes(_build_frame(EVENT_FINISH_SESSION, session_id=session_id))
+
+            send_task = asyncio.create_task(_send_text())
+
+            emitter.start_segment(segment_id=utils.shortuuid())
+            tts_start = time.perf_counter()
+            first_audio = True
+            while True:
+                resp = _parse_response(await ws.receive_bytes())
+                if resp is None:
+                    continue
+                payload = resp.get("payload", b"")
+                if isinstance(payload, dict) and "error" in payload:
+                    raise APIConnectionError(f"TTS server error: {payload['error']}")
+                event = resp.get("event", 0)
+                if event == EVENT_TTS_RESPONSE:
+                    data = payload
+                    if isinstance(data, bytes) and data:
+                        if first_audio:
+                            first_audio = False
+                            logger.info("tts first response", extra={"spent": round(time.perf_counter() - tts_start, 4)})
+                        emitter.push(data=data)
+                elif event == EVENT_SESSION_FINISHED:
+                    break
+                elif event == EVENT_SESSION_FAILED:
+                    raise APIConnectionError(f"TTS session failed: {payload}")
+
+            emitter.end_segment()
+            await send_task
+            logger.info("tts end", extra={"request_id": request_id})
+
+            await ws.send_bytes(_build_frame(EVENT_FINISH_CONNECTION))
+            await ws.receive_bytes()
+
         except asyncio.TimeoutError:
-            logger.error(
-                "tts timeout error",
-                extra={"request_id": request_id, "error_type": "TimeoutError", "retryable": True},
-            )
+            logger.error("tts timeout", extra={"request_id": request_id})
             raise APITimeoutError(retryable=True)
         except aiohttp.ClientError as e:
-            logger.error(
-                "tts connection error",
-                extra={"request_id": request_id, "error_type": type(e).__name__, "retryable": True},
-                exc_info=True,
-            )
+            logger.error("tts connection error", extra={"request_id": request_id, "error": type(e).__name__}, exc_info=True)
             raise APIConnectionError(retryable=True) from e
+        except APIConnectionError:
+            raise
         except Exception as e:
-            logger.error(
-                "tts unexpected error",
-                extra={"request_id": request_id, "error_type": type(e).__name__, "retryable": False},
-                exc_info=True,
-            )
+            logger.error("tts unexpected error", extra={"request_id": request_id, "error": type(e).__name__}, exc_info=True)
             raise APIConnectionError(retryable=False) from e
-
-
-def parse_response(res) -> Tuple[bool, ByteString | None]:
-    header_size = res[0] & 0x0F
-    message_type = res[1] >> 4
-    message_type_specific_flags = res[1] & 0x0F
-    message_compression = res[2] & 0x0F
-    payload = res[header_size * 4 :]
-    if message_type == 0xB:  # audio-only server response
-        if message_type_specific_flags == 0:  # no sequence number as ACK
-            return False, None
-        else:
-            sequence_number = int.from_bytes(payload[:4], "big", signed=True)
-            payload = payload[8:]
-        if sequence_number < 0:
-            return True, payload
-        else:
-            return False, payload
-    elif message_type == 0xF:
-        error_msg = payload[8:]
-        if message_compression == 1:
-            error_msg = gzip.decompress(error_msg)
-        error_msg = str(error_msg, "utf-8")
-
-        return True, None
-    elif message_type == 0xC:
-        payload = payload[4:]
-        if message_compression == 1:
-            payload = gzip.decompress(payload)
-        return False, None
-    else:
-        return True, None
+        finally:
+            await ws.close()

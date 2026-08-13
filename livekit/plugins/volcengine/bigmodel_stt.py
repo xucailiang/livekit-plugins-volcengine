@@ -27,7 +27,6 @@ from livekit.agents.utils import AudioBuffer
 from .log import logger
 
 PROTOCOL_VERSION = 0b0001
-DEFAULT_HEADER_SIZE = 0b0001
 
 # Message Type:
 FULL_CLIENT_REQUEST = 0b0001
@@ -41,14 +40,12 @@ NO_SEQUENCE = 0b0000  # no check sequence
 POS_SEQUENCE = 0b0001
 NEG_SEQUENCE = 0b0010
 NEG_WITH_SEQUENCE = 0b0011
-NEG_SEQUENCE_1 = 0b0011
 
 # Message Serialization
 NO_SERIALIZATION = 0b0000
 JSON = 0b0001
 
 # Message Compression
-NO_COMPRESSION = 0b0000
 GZIP = 0b0001
 
 
@@ -82,13 +79,13 @@ def generate_before_payload(sequence: int):
 
 @dataclass
 class BigModelSTTOptions:
-    # app
-    app_id: str | None = None
-    access_token: str | None = None
-    source_type: Literal["duration", "concurrent"] = "duration"
+    # auth — 新版统一使用 X-Api-Key 单 key 鉴权
+    api_key: str | None = None
+    # 资源 ID: ASR 1.0 用 volc.bigasr.sauc.*, ASR 2.0 用 volc.seedasr.sauc.*
+    resource_id: str = "volc.bigasr.sauc.duration"
 
     # audio
-    base_url: str = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel"
+    base_url: str = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async"
     format: Literal["pcm", "wav", "ogg"] = "pcm"
     sample_rate: int = 16000
     bits: int = 16
@@ -98,17 +95,15 @@ class BigModelSTTOptions:
     # request
     model_name: str = "bigmodel"
     codec: Literal["raw", "opus"] = "raw"
+    enable_nonstream: bool = False
     enable_itn: bool = False
     enable_punc: bool = True
     enable_ddc: bool = False
-    show_utterance: bool = True
+    show_utterances: bool = True
     result_type: Literal["full", "single"] = "single"
     vad_segment_duration: int = 3000
-    end_window_size: int = 500
+    end_window_size: int = 800
     force_to_speech_time: int = 1000
-
-    def get_ws_url(self):
-        return self.base_url
 
     def get_ws_query_params(self, uid: str | None = None) -> bytearray:
         if uid is None:
@@ -119,36 +114,29 @@ class BigModelSTTOptions:
                 "format": self.format,
                 "rate": self.sample_rate,
                 "bits": self.bits,
-                "channels": self.num_channels,
+                "channel": self.num_channels,
                 "codec": self.codec,
             },
             "request": {
                 "model_name": self.model_name,
+                "enable_nonstream": self.enable_nonstream,
                 "enable_itn": self.enable_itn,
                 "enable_punc": self.enable_punc,
                 "enable_ddc": self.enable_ddc,
-                "show_utterance": self.show_utterance,
+                "show_utterances": self.show_utterances,
                 "result_type": self.result_type,
                 "vad_segment_duration": self.vad_segment_duration,
                 "end_window_size": self.end_window_size,
                 "force_to_speech_time": self.force_to_speech_time,
             },
         }
-        payload_bytes = str.encode(json.dumps(submit_request_json))
-        payload_bytes = gzip.compress(
-            payload_bytes
-        )  # if no compression, comment this line
+        payload_bytes = gzip.compress(str.encode(json.dumps(submit_request_json)))
         full_client_request = bytearray(
             generate_header(message_type_specific_flags=POS_SEQUENCE)
         )
-        seq = 1
-        full_client_request.extend(
-            generate_before_payload(sequence=seq)
-        )  # payload size(4 bytes)
-        full_client_request.extend(
-            (len(payload_bytes)).to_bytes(4, "big")
-        )  # payload size(4 bytes)
-        full_client_request.extend(payload_bytes)  # payload
+        full_client_request.extend(generate_before_payload(sequence=1))
+        full_client_request.extend(len(payload_bytes).to_bytes(4, "big"))
+        full_client_request.extend(payload_bytes)
         return full_client_request
 
     def get_chunk_request(
@@ -179,21 +167,10 @@ class BigModelSTTOptions:
         header = {}
         if reqid is None:
             reqid = utils.shortuuid()
-        if self.source_type == "duration":
-            header["X-Api-Resource-Id"] = "volc.bigasr.sauc.duration"
-        else:
-            header["X-Api-Resource-Id"] = "volc.bigasr.sauc.concurrent"
-        if self.app_id is None:
-            self.app_id = os.environ.get("VOLCENGINE_STT_APP_ID", None)
-            if self.app_id is None:
-                raise ValueError("VOLCENGINE_STT_APP_ID is not set")
-        if self.access_token is None:
-            self.access_token = os.environ.get("VOLCENGINE_STT_ACCESS_TOKEN", None)
-            if self.access_token is None:
-                raise ValueError("VOLCENGINE_STT_ACCESS_TOKEN is not set")
-        header["X-Api-Access-Key"] = self.access_token
-        header["X-Api-App-Key"] = self.app_id
+        header["X-Api-Resource-Id"] = self.resource_id
+        header["X-Api-Key"] = self.api_key
         header["X-Api-Request-Id"] = reqid
+        header["X-Api-Sequence"] = "-1"
         return header
 
 
@@ -201,39 +178,42 @@ class BigModelSTT(stt.STT):
     def __init__(
         self,
         *,
-        app_id: str | None = None,
-        base_url: str = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel",
-        access_token: str | None = None,
+        api_key: str | None = None,
+        base_url: str = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async",
+        resource_id: str = "volc.bigasr.sauc.duration",
         model_name: str = "bigmodel",
+        language: str = "zh-CN",
+        enable_nonstream: bool = False,
         enable_itn: bool = False,
         enable_punc: bool = True,
         enable_ddc: bool = False,
+        show_utterances: bool = True,
+        result_type: Literal["full", "single"] = "single",
         vad_segment_duration: int = 3000,
-        end_window_size: int = 500,
+        end_window_size: int = 800,
         force_to_speech_time: int = 1000,
         http_session: aiohttp.ClientSession | None = None,
         interim_results: bool = True,
     ) -> None:
-        """火山引擎大模型实时语音识别
+        """火山引擎豆包大模型实时语音识别 (v3 bigmodel_async)
 
-                Args:
-                    app_id (str): 应用ID,可以在控制台查看。
-                    base_url (str, optional): 地址. Defaults to "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel".
-                    access_token (str | None, optional): 使用火山引擎控制台获取的Access Token. Defaults to None.
-                    audio_format (Literal[&quot;raw&quot;, &quot;wav&quot;, &quot;mp3&quot;, &quot;ogg&quot;], optional): 音频容器格式. Defaults to "raw".
-                    sample_rate (int, optional): 音频采样率. Defaults to 16000.
-                    bits (int, optional): 音频采样点位数. Defaults to 16.
-                    num_channels (int, optional): 音频声道数. Defaults to 1.
-                    model_name (str, optional): 模型名称，目前只有bigmodel. Defaults to "bigmodel".
-                    codec (Literal[&quot;raw&quot;, &quot;opus&quot;], optional): 音频编码格式. Defaults to "raw".
-                    enable_itn (bool, optional): 文本规范化 (ITN) 是自动语音识别 (ASR) 后处理管道的一部分。 ITN 的任务是将 ASR 模型的原始语音输出转换为书面形式，以提高文本的可读性。
-        例如，“一九七零年”->“1970年”和“一百二十三美元”->“$123”。. Defaults to False.
-                    enable_punc (bool, optional): 启用标点. Defaults to True.
-                    enable_ddc (bool, optional): **语义顺滑**‌是一种技术，旨在提高自动语音识别（ASR）结果的文本可读性和流畅性。这项技术通过删除或修改ASR结果中的不流畅部分，如停顿词、语气词、语义重复词等，使得文本更加易于阅读和理解。. Defaults to False.
-                    vad_segment_duration (int, optional): 单位ms，默认为3000。当静音时间超过该值时，会将文本分为两个句子。不决定判停，所以不会修改definite出现的位置。在end_window_size配置后，该参数失效。. Defaults to 3000.
-                    end_window_size (int, optional): 单位ms，默认为800，最小200。静音时长超过该值，会直接判停，输出definite。配置该值，不使用语义分句，根据静音时长来分句。用于实时性要求较高场景，可以提前获得definite句子. Defaults to 500.
-                    force_to_speech_time (int, optional): 单位ms，默认为10000，最小1。音频时长超过该值之后，才会判停，根据静音时长输出definite，需配合end_window_size使用。
-        用于解决短音频+实时性要求较高场景，不配置该参数，只使用end_window_size时，前10s不会判停。推荐设置1000，可能会影响识别准确率. Defaults to 1000.
+        Args:
+            api_key: 火山引擎 API Key，在控制台获取。未提供时从 VOLCENGINE_STT_API_KEY 读取。
+            base_url: WebSocket 地址，默认 bigmodel_async。
+            resource_id: 模型版本。2.0: volc.seedasr.sauc.*, 1.0: volc.bigasr.sauc.*
+            model_name: 模型名称，固定 "bigmodel"。
+            language: 识别语种，默认 "zh-CN"。支持 zh-CN, en-US, ja-JP, yue-CN 等。
+            enable_nonstream: 二遍识别。开启后实时+非流式双重识别，definite 仅由二遍结果标记，准确率更高。
+            enable_itn: 文本规范化（口语→书面），默认 False。
+            enable_punc: 启用标点，默认 True。
+            enable_ddc: 语义顺滑（去冗余/犹豫词），默认 False。
+            show_utterances: 输出分句/分词/时间戳信息，默认 True。
+            result_type: full=全量返回, single=增量返回（默认）。
+            vad_segment_duration: 语义分段最大静音(ms)，默认 3000。
+            end_window_size: VAD 判停静音阈值(ms)，默认 800，范围 [300,5000]。
+            force_to_speech_time: 判停前最小音频时长(ms)，推荐 1000。
+            http_session: 外部 aiohttp session。
+            interim_results: 是否发送中间结果，默认 True。
         """
         super().__init__(
             capabilities=stt.STTCapabilities(
@@ -243,14 +223,24 @@ class BigModelSTT(stt.STT):
             )
         )
 
+        api_key = api_key or os.environ.get("VOLCENGINE_STT_API_KEY") or os.environ.get("VOLCENGINE_API_KEY")
+        if api_key is None:
+            raise ValueError(
+                "api_key is required. Pass api_key parameter or set VOLCENGINE_STT_API_KEY / VOLCENGINE_API_KEY."
+            )
+
         self._opts = BigModelSTTOptions(
             base_url=base_url,
-            access_token=access_token,
-            app_id=app_id,
+            api_key=api_key,
+            resource_id=resource_id,
             model_name=model_name,
+            language=language,
+            enable_nonstream=enable_nonstream,
             enable_itn=enable_itn,
             enable_punc=enable_punc,
             enable_ddc=enable_ddc,
+            show_utterances=show_utterances,
+            result_type=result_type,
             vad_segment_duration=vad_segment_duration,
             end_window_size=end_window_size,
             force_to_speech_time=force_to_speech_time,
@@ -262,7 +252,6 @@ class BigModelSTT(stt.STT):
     def _ensure_session(self) -> aiohttp.ClientSession:
         if not self._session:
             self._session = utils.http_context.http_session()
-
         return self._session
 
     @property
@@ -430,7 +419,7 @@ class SpeechStream(stt.SpeechStream):
     async def _connect_ws(self) -> aiohttp.ClientWebSocketResponse:
         ws = await asyncio.wait_for(
             self._session.ws_connect(
-                self._opts.get_ws_url(),
+                self._opts.base_url,
                 headers=self._opts.get_ws_header(reqid=self._request_id),
                 max_msg_size=1000000000,
             ),
@@ -438,10 +427,20 @@ class SpeechStream(stt.SpeechStream):
         )
         return ws
 
-    def _process_stream_event(self, data: dict) -> None:
-        results = parse_response(res=data)["payload_msg"]
-        result = results.get("result", None)
+    def _process_stream_event(self, data: bytes) -> None:
+        parsed = parse_response(res=data)
+        payload_msg = parsed.get("payload_msg")
+        if not isinstance(payload_msg, dict):
+            return
+        result = payload_msg.get("result", None)
         if result is None:
+            return
+        # result 可能是单对象(dict)或数组(list)，统一取第一个
+        if isinstance(result, list):
+            if len(result) == 0:
+                return
+            result = result[0]
+        if not isinstance(result, dict):
             return
         text = result.get("text", "")
         if text == "":
@@ -450,84 +449,48 @@ class SpeechStream(stt.SpeechStream):
         if len(utterances) == 0:
             return
         language = self._opts.language
-        definite = utterances[0].get("definite", "False")
+        definite = utterances[0].get("definite", False)
         start_time = utterances[0].get("start_time", 0.0)
         end_time = utterances[0].get("end_time", 0.0)
         confidence = result.get("confidence", 0.0)
         if not definite and not self._speaking:
             self._speaking = True
-            start_event = stt.SpeechEvent(type=stt.SpeechEventType.START_OF_SPEECH)
-            self._event_ch.send_nowait(start_event)
-            logger.info(
-                "transcription start",
-                extra={
-                    "request_id": self._request_id,
-                    "model": self._stt.model,
-                },
-            )
-            if text:
-                alternatives = [
-                    stt.SpeechData(
-                        language=language,
-                        text=text,
-                        start_time=start_time,
-                        end_time=end_time,
-                        confidence=confidence,
-                    )
-                ]
-                interim_event = stt.SpeechEvent(
-                    type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
-                    request_id=self._request_id,
-                    alternatives=alternatives,
-                )
-                self._event_ch.send_nowait(interim_event)
-
-        elif not definite and self._speaking:
-            alternatives = [
-                stt.SpeechData(
-                    text=text,
-                    start_time=start_time,
-                    end_time=end_time,
-                    confidence=confidence,
-                    language=language,
-                )
-            ]
-            interim_event = stt.SpeechEvent(
+            self._event_ch.send_nowait(stt.SpeechEvent(type=stt.SpeechEventType.START_OF_SPEECH))
+            self._event_ch.send_nowait(stt.SpeechEvent(
                 type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
                 request_id=self._request_id,
-                alternatives=alternatives,
-            )
-            self._event_ch.send_nowait(interim_event)
+                alternatives=[stt.SpeechData(
+                    language=language, text=text,
+                    start_time=start_time, end_time=end_time, confidence=confidence,
+                )],
+            ))
 
-        elif definite and self._speaking:
-            alternatives = [
-                stt.SpeechData(
-                    text=text,
-                    start_time=start_time,
-                    end_time=end_time,
-                    confidence=confidence,
-                    language=language,
-                )
-            ]
-            interim_event = stt.SpeechEvent(
+        elif not definite and self._speaking:
+            self._event_ch.send_nowait(stt.SpeechEvent(
+                type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
+                request_id=self._request_id,
+                alternatives=[stt.SpeechData(
+                    text=text, start_time=start_time, end_time=end_time,
+                    confidence=confidence, language=language,
+                )],
+            ))
+
+        elif definite:
+            if not self._speaking:
+                self._speaking = True
+                self._event_ch.send_nowait(stt.SpeechEvent(type=stt.SpeechEventType.START_OF_SPEECH))
+            self._event_ch.send_nowait(stt.SpeechEvent(
                 type=stt.SpeechEventType.FINAL_TRANSCRIPT,
                 request_id=self._request_id,
-                alternatives=alternatives,
-            )
-            self._event_ch.send_nowait(interim_event)
-            end_event = stt.SpeechEvent(
-                type=stt.SpeechEventType.END_OF_SPEECH, request_id=self._request_id
-            )
-            self._event_ch.send_nowait(end_event)
+                alternatives=[stt.SpeechData(
+                    text=text, start_time=start_time, end_time=end_time,
+                    confidence=confidence, language=language,
+                )],
+            ))
+            self._event_ch.send_nowait(stt.SpeechEvent(
+                type=stt.SpeechEventType.END_OF_SPEECH, request_id=self._request_id,
+            ))
             self._speaking = False
-            logger.info(
-                "transcription end",
-                extra={
-                    "request_id": self._request_id,
-                    "text": text,
-                    "model": self._stt.model,
-                },
-            )
 
 
 def parse_response(res):
@@ -587,18 +550,3 @@ def parse_response(res):
     return result
 
 
-def live_transcription_to_speech_data(
-    language: str, data: dict
-) -> list[stt.SpeechData]:
-    dg_alts = data["channel"]["alternatives"]
-
-    return [
-        stt.SpeechData(
-            language=language,
-            start_time=alt["words"][0]["start"] if alt["words"] else 0,
-            end_time=alt["words"][-1]["end"] if alt["words"] else 0,
-            confidence=alt["confidence"],
-            text=alt["transcript"],
-        )
-        for alt in dg_alts
-    ]

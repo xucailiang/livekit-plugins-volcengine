@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import copy
 import json
 import os
 import time
@@ -28,17 +27,8 @@ from .log import logger
 
 
 PROTOCOL_VERSION = 0b0001
-DEFAULT_HEADER_SIZE = 0b0001
 
-PROTOCOL_VERSION_BITS = 4
-HEADER_BITS = 4
-MESSAGE_TYPE_BITS = 4
-MESSAGE_TYPE_SPECIFIC_FLAGS_BITS = 4
-MESSAGE_SERIALIZATION_BITS = 4
-MESSAGE_COMPRESSION_BITS = 4
-RESERVED_BITS = 8
-
-# Message Type:
+# Message Type
 CLIENT_FULL_REQUEST = 0b0001
 CLIENT_AUDIO_ONLY_REQUEST = 0b0010
 
@@ -47,23 +37,16 @@ SERVER_ACK = 0b1011
 SERVER_ERROR_RESPONSE = 0b1111
 
 # Message Type Specific Flags
-NO_SEQUENCE = 0b0000  # no check sequence
-POS_SEQUENCE = 0b0001
 NEG_SEQUENCE = 0b0010
-NEG_SEQUENCE_1 = 0b0011
 
 MSG_WITH_EVENT = 0b0100
 
 # Message Serialization
 NO_SERIALIZATION = 0b0000
 JSON = 0b0001
-THRIFT = 0b0011
-CUSTOM_TYPE = 0b1111
 
 # Message Compression
-NO_COMPRESSION = 0b0000
 GZIP = 0b0001
-CUSTOM_COMPRESSION = 0b1111
 
 
 def generate_header(
@@ -163,8 +146,7 @@ def parse_response(res):
 
 @dataclass
 class _RealtimeOptions:
-    app_id: str
-    access_token: str
+    api_key: str
     bot_name: str
     system_role: str
     max_session_duration: float | None
@@ -177,11 +159,11 @@ class _RealtimeOptions:
     num_channels: int = 1
     format: str = "pcm"
     model: Literal["O", "SC"] = "O"
-    character_manifest: str = None
+    character_manifest: str | None = None
     end_smooth_window_ms: int = 500
     enable_volc_websearch: bool = False
     volc_websearch_type: Literal["web_summary", "web"] = "web_summary"
-    volc_websearch_api_key: str = None
+    volc_websearch_api_key: str | None = None
     volc_websearch_no_result_message: str = "抱歉，我找不到相关信息。"
 
     @property
@@ -190,10 +172,8 @@ class _RealtimeOptions:
 
     def get_ws_headers(self) -> dict:
         headers = {
-            "X-Api-App-ID": self.app_id,
-            "X-Api-Access-Key": self.access_token,
-            "X-Api-Resource-Id": "volc.speech.dialog",  # 固定值
-            "X-Api-App-Key": "PlgvMymc7f3tQnJ6",  # 固定值
+            "X-Api-Key": self.api_key,
+            "X-Api-Resource-Id": "volc.speech.dialog",
             "X-Api-Connect-Id": str(uuid.uuid4()),
         }
         return headers
@@ -258,21 +238,21 @@ class _ResponseGeneration:
 class RealtimeModel(llm.RealtimeModel):
     def __init__(
         self,
+        *,
+        api_key: str | None = None,
         bot_name: str = "豆包",
         speaking_style: str = "你的说话风格简洁明了，语速适中，语调自然。",
         speaker: str = "zh_female_vv_jupiter_bigtts",
         opening: str | None = None,
-        app_id: str | None = None,
-        access_token: str | None = None,
         system_role: str | None = None,
-        character_manifest: str = None,
+        character_manifest: str | None = None,
         model: Literal["O", "SC"] = "O",
         end_smooth_window_ms: int = 500,
         enable_volc_websearch: bool = False,
         volc_websearch_type: Literal["web_summary", "web"] = "web_summary",
-        volc_websearch_api_key: str = None,
+        volc_websearch_api_key: str | None = None,
         volc_websearch_no_result_message: str = "抱歉，我找不到相关信息。",
-        rag_fn: Callable[[str], str] = None,
+        rag_fn: Callable[[str], str] | None = None,
         audio_output: bool = True,
         modalities: NotGivenOr[list[Literal["text", "audio"]]] = NOT_GIVEN,
         http_session: aiohttp.ClientSession | None = None,
@@ -301,17 +281,13 @@ class RealtimeModel(llm.RealtimeModel):
                 "enable_volc_websearch": enable_volc_websearch,
             },
         )
-        app_id = app_id or os.environ.get("VOLCENGINE_REALTIME_APP_ID")
-        if app_id is None:
-            raise ValueError("VOLCENGINE_REALTIME_APP_ID is required")
-        access_token = access_token or os.environ.get(
-            "VOLCENGINE_REALTIME_ACCESS_TOKEN"
-        )
-        if access_token is None:
-            raise ValueError("VOLCENGINE_REALTIME_ACCESS_TOKEN is required")
+        api_key = api_key or os.environ.get("VOLCENGINE_REALTIME_API_KEY") or os.environ.get("VOLCENGINE_API_KEY")
+        if api_key is None:
+            raise ValueError(
+                "api_key is required. Pass api_key parameter or set VOLCENGINE_REALTIME_API_KEY / VOLCENGINE_API_KEY."
+            )
         self._opts = _RealtimeOptions(
-            app_id=app_id,
-            access_token=access_token,
+            api_key=api_key,
             bot_name=bot_name,
             system_role=system_role,
             speaker=speaker,
@@ -402,9 +378,6 @@ class RealtimeSession(
         self._response_created_futures: dict[
             str, asyncio.Future[llm.GenerationCreatedEvent]
         ] = {}
-        self._item_delete_future: dict[str, asyncio.Future] = {}
-        self._item_create_future: dict[str, asyncio.Future] = {}
-
         self._current_generation: _ResponseGeneration | None = None
         self._current_item: _MessageGeneration | None = None
         self._remote_chat_ctx = llm.remote_chat_context.RemoteChatContext()
@@ -422,9 +395,7 @@ class RealtimeSession(
             self._realtime_model._opts.num_channels,
             samples_per_channel=self._realtime_model._opts.sample_rate // 10,
         )
-        self._pushed_duration_s: float = (
-            0  # duration of audio pushed to the OpenAI Realtime API
-        )
+        self._pushed_duration_s: float = 0
 
     def send_event(self, event: rtc.AudioFrame) -> None:
         with contextlib.suppress(utils.aio.channel.ChanClosed):
@@ -440,7 +411,6 @@ class RealtimeSession(
                 "provider": "volcengine",
             },
         )
-        # while not self._msg_ch.closed:
         ws_conn = await self._create_ws_conn()
 
         try:
@@ -461,7 +431,6 @@ class RealtimeSession(
             "realtime session ended",
             extra={"session_id": self.session_id},
         )
-        # break
 
     async def _create_ws_conn(self) -> aiohttp.ClientWebSocketResponse:
         headers = self._realtime_model._opts.get_ws_headers()
@@ -475,7 +444,6 @@ class RealtimeSession(
         )
 
     async def _run_ws(self, ws_conn: aiohttp.ClientWebSocketResponse) -> None:
-        closing = False
         logger.info("start connection")
         start_connection_request = bytearray(generate_header())
         start_connection_request.extend(int(1).to_bytes(4, "big"))
@@ -503,7 +471,6 @@ class RealtimeSession(
             hello_request.extend((len(payload_bytes)).to_bytes(4, "big"))
             hello_request.extend(payload_bytes)
             await ws_conn.send_bytes(hello_request)
-            self._is_opening = True
             logger.info("send hello request")
 
             self._current_generation = _ResponseGeneration(
@@ -547,7 +514,6 @@ class RealtimeSession(
 
         @utils.log_exceptions(logger=logger)
         async def _send_task() -> None:
-            nonlocal closing
             async for frame in self._msg_ch:
                 try:
                     task_request = bytearray(
@@ -569,9 +535,6 @@ class RealtimeSession(
                 except Exception:
                     logger.error("send task error", exc_info=True)
                     break
-
-            closing = True
-            await ws_conn.close()
 
         @utils.log_exceptions(logger=logger)
         async def _recv_task() -> None:
@@ -657,8 +620,8 @@ class RealtimeSession(
                             payload = {
                                 "external_rag": rag_result,
                             }
-                            payload_bytes = str.encode(json.dumps(payload))
-                            payload_bytes = gzip.compress(payload_bytes)
+                            rag_payload_bytes = str.encode(json.dumps(payload))
+                            rag_payload_bytes = gzip.compress(rag_payload_bytes)
                             chat_rag_text_request = bytearray(generate_header())
                             chat_rag_text_request.extend(int(502).to_bytes(4, "big"))
                             chat_rag_text_request.extend(
@@ -666,9 +629,9 @@ class RealtimeSession(
                             )
                             chat_rag_text_request.extend(str.encode(self.session_id))
                             chat_rag_text_request.extend(
-                                (len(payload_bytes)).to_bytes(4, "big")
+                                (len(rag_payload_bytes)).to_bytes(4, "big")
                             )
-                            chat_rag_text_request.extend(payload_bytes)
+                            chat_rag_text_request.extend(rag_payload_bytes)
                             await ws_conn.send_bytes(chat_rag_text_request)
                             logger.info("rag end")
                         logger.info("llm start")
@@ -739,35 +702,7 @@ class RealtimeSession(
 
         finally:
             await utils.aio.cancel_and_wait(*tasks)
-            await ws_conn.close()
-
-    def _create_session_update_event(self):
-        pass
-
-    async def chat_tts_text(
-        self,
-        start: bool,
-        end: bool,
-        content: str,
-        ws_conn: aiohttp.ClientWebSocketResponse,
-    ) -> None:
-        """发送Chat TTS Text消息"""
-        payload = {
-            "start": start,
-            "end": end,
-            "content": content,
-        }
-        logger.info("ChatTTSTextRequest")
-        payload_bytes = str.encode(json.dumps(payload))
-        payload_bytes = gzip.compress(payload_bytes)
-
-        chat_tts_text_request = bytearray(generate_header())
-        chat_tts_text_request.extend(int(500).to_bytes(4, "big"))
-        chat_tts_text_request.extend((len(self.session_id)).to_bytes(4, "big"))
-        chat_tts_text_request.extend(str.encode(self.session_id))
-        chat_tts_text_request.extend((len(payload_bytes)).to_bytes(4, "big"))
-        chat_tts_text_request.extend(payload_bytes)
-        await ws_conn.send_bytes(chat_tts_text_request)
+            await self._finish(ws_conn)
 
     async def _start_session(
         self, ws_conn: aiohttp.ClientWebSocketResponse, dialog_id: str
@@ -787,27 +722,31 @@ class RealtimeSession(
         _ = await ws_conn.receive_bytes()
 
     async def _finish_session(self, ws_conn: aiohttp.ClientWebSocketResponse) -> None:
-        finish_session_request = bytearray(generate_header())
-        finish_session_request.extend(int(102).to_bytes(4, "big"))
-        payload_bytes = str.encode("{}")
-        payload_bytes = gzip.compress(payload_bytes)
-        finish_session_request.extend((len(self.session_id)).to_bytes(4, "big"))
-        finish_session_request.extend(str.encode(self.session_id))
-        finish_session_request.extend((len(payload_bytes)).to_bytes(4, "big"))
-        finish_session_request.extend(payload_bytes)
-        await ws_conn.send_bytes(finish_session_request)
+        request = bytearray(generate_header())
+        request.extend(int(102).to_bytes(4, "big"))
+        request.extend((len(self.session_id)).to_bytes(4, "big"))
+        request.extend(str.encode(self.session_id))
+        payload = gzip.compress(b"{}")
+        request.extend((len(payload)).to_bytes(4, "big"))
+        request.extend(payload)
+        await ws_conn.send_bytes(request)
 
-    async def _finish_connection(
-        self, ws_conn: aiohttp.ClientWebSocketResponse
-    ) -> None:
-        finish_connection_request = bytearray(generate_header())
-        finish_connection_request.extend(int(2).to_bytes(4, "big"))
-        payload_bytes = str.encode("{}")
-        payload_bytes = gzip.compress(payload_bytes)
-        finish_connection_request.extend((len(payload_bytes)).to_bytes(4, "big"))
-        finish_connection_request.extend(payload_bytes)
-        await ws_conn.send_bytes(finish_connection_request)
-        _ = await ws_conn.receive_bytes()
+    async def _finish_connection(self, ws_conn: aiohttp.ClientWebSocketResponse) -> None:
+        request = bytearray(generate_header())
+        request.extend(int(2).to_bytes(4, "big"))
+        payload = gzip.compress(b"{}")
+        request.extend((len(payload)).to_bytes(4, "big"))
+        request.extend(payload)
+        await ws_conn.send_bytes(request)
+
+    async def _finish(self, ws_conn: aiohttp.ClientWebSocketResponse) -> None:
+        try:
+            await self._finish_session(ws_conn)
+            await self._finish_connection(ws_conn)
+            await asyncio.wait_for(ws_conn.receive_bytes(), timeout=2)
+        except Exception:
+            pass
+        await ws_conn.close()
 
     @property
     def chat_ctx(self) -> llm.ChatContext:
@@ -843,11 +782,6 @@ class RealtimeSession(
             logger.debug(
                 "update_chat_ctx called but not fully supported by volcengine realtime API"
             )
-
-    def _create_update_chat_ctx_events(self, chat_ctx: llm.ChatContext):
-        events = []
-
-        return events
 
     async def update_instructions(self, instructions: str) -> None:
         self._opts.system_role = instructions
@@ -902,21 +836,8 @@ class RealtimeSession(
         audio_end_ms: int,
         audio_transcript: NotGivenOr[str] = NOT_GIVEN,
     ) -> None:
-        if "audio" in modalities:
-            # 当前 volcengine 实时接口未暴露远端音频截断事件；占位以对齐接口
-            pass
-        elif utils.is_given(audio_transcript):
-            # 同步转写文本到远端会话上下文
-            chat_ctx = self.chat_ctx.copy()
-            if (idx := chat_ctx.index_by_id(message_id)) is not None:
-                new_item = copy.copy(chat_ctx.items[idx])
-                assert new_item.type == "message"
-
-                new_item.content = [audio_transcript]
-                chat_ctx.items[idx] = new_item
-                events = self._create_update_chat_ctx_events(chat_ctx)
-                for ev in events:
-                    self.send_event(ev)
+        # volcengine 未暴露远端截断事件
+        pass
 
     async def aclose(self) -> None:
         self._msg_ch.close()

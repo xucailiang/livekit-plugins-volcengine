@@ -10,6 +10,8 @@ __pycache__/
 *.wav
 *.mp3
 test_*
+!test_volcengine_plugin.py
+docs/
 
 # Distribution / packaging
 .Python

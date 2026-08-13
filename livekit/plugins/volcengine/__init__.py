@@ -1,6 +1,5 @@
 from .bigmodel_stt import BigModelSTT
 from .llm import LLM
-from .stt import STT
 from .tts import TTS
 from .realtime import RealtimeModel
 from .version import __version__, check_livekit_agents_version
@@ -8,7 +7,7 @@ from .version import __version__, check_livekit_agents_version
 # 在模块加载时检查版本
 check_livekit_agents_version()
 
-__all__ = ["TTS", "LLM", "STT", "BigModelSTT", "RealtimeModel", "__version__", "check_livekit_agents_version"]
+__all__ = ["TTS", "LLM", "BigModelSTT", "RealtimeModel", "__version__", "check_livekit_agents_version"]
 
 from livekit.agents import Plugin
 
